@@ -1,2 +1,227 @@
-429: Too Many Requests
-For more on scraping GitHub and how it may affect your rights, please review our Terms of Service (https://docs.github.com/en/site-policy/github-terms/github-terms-of-service).
+# .github/workflows/evm-project-report.yml
+name: Relatório Semanal de Valor Agregado (EVM)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * 1'
+
+permissions:
+  issues: write
+  repository-projects: read
+  contents: read # 'contents: read' é necessário para o 'checkout'
+
+jobs:
+  generate-evm-report:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECT_READ }}
+      PROJECT_NUMBER: 3
+      REPORT_ISSUE_NUMBER: 1
+
+    steps:
+      # --- CORREÇÃO 1: ADICIONADO O CHECKOUT ---
+      # Isso corrige o erro "fatal: not a git repository"
+      # Ele dá ao 'gh' o contexto do repositório
+      - name: 0. Checkout do Repositório
+        uses: actions/checkout@v4
+
+      # --- ETAPAS EXISTENTES ---
+      - name: 1. Instalar Dependência 'bc' (Cálculos)
+        run: |
+          echo "Instalando 'bc' (para cálculos decimais)"
+          sudo apt-get update
+          sudo apt-get install -y bc
+          echo "'bc' instalado. 'gh project' é nativo."
+
+      - name: 2. Gerar Relatório de Valor Agregado (EVM)
+        run: |
+          #!/bin/bash
+          set -e
+          
+          echo "Iniciando geração de relatório EVM para o Projeto $PROJECT_NUMBER..."
+
+          echo "Buscando ID do Projeto $PROJECT_NUMBER para o dono @me (usuário autenticado)..."
+          PROJECT_NODE_ID=$(gh project list --owner "@me" --format json | jq -r --argjson num $PROJECT_NUMBER '.projects[] | select(.number == $num) | .id')
+          
+          if [ -z "$PROJECT_NODE_ID" ]; then
+            echo "Erro Crítico: Projeto com número $PROJECT_NUMBER não encontrado para o usuário @me."
+            exit 1
+          fi
+          echo "ID do Projeto encontrado: $PROJECT_NODE_ID"
+
+          # --- CORREÇÃO 2: VERIFIQUE SEUS CAMPOS ---
+          # O script procura EXATAMENTE por:
+          # "Status", "Baseline Fim", "Custo Planejado", "Custo Real", "% Concluído"
+          # Se os nomes no seu Projeto 3 forem diferentes, o script trará 0 dados.
+          
+          GRAPHQL_QUERY='
+          query($project_id: ID!) {
+            node(id: $project_id) {
+              ... on ProjectV2 {
+                items(first: 100, orderBy: {field: POSITION, direction: ASC}) {
+                  nodes {
+                    content {
+                      ... on Issue { title }
+                      ... on PullRequest { title }
+                    }
+                    fieldValues(first: 20) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          field { ... on ProjectV2Field { name } }
+                          name
+                        }
+                        ... on ProjectV2ItemFieldNumberValue {
+                          field { ... on ProjectV2Field { name } }
+                          number
+                        }
+                        ... on ProjectV2ItemFieldDateValue {
+                          field { ... on ProjectV2Field { name } }
+                          date
+                        }
+                        ... on ProjectV2ItemFieldTextValue {
+                          field { ... on ProjectV2Field { name } }
+                          text
+                        }
+                        ... on ProjectV2ItemFieldIterationValue {
+                          field { ... on ProjectV2IterationField { name } }
+                          title
+                        }
+                        ... on ProjectV2ItemFieldLabelValue { __typename }
+                        ... on ProjectV2ItemFieldMilestoneValue { __typename }
+                        ... on ProjectV2ItemFieldReviewerValue { __typename }
+                        ... on ProjectV2ItemFieldRepositoryValue { __typename }
+                        ... on ProjectV2ItemFieldUserValue { __typename }
+                        ... on ProjectV2ItemFieldPullRequestValue { __typename }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          JQ_FILTER='
+          .data.node.items.nodes | .[] | 
+          ( 
+            .fieldValues.nodes 
+            | map( 
+                select(.field.name != null) | 
+                { (.field.name): (if .name then .name else (.number // .date // "0.0") end) } 
+              ) 
+            | add 
+          ) as $fields
+          | [
+              .content.title,
+              $fields.Status,
+              $fields["Baseline Fim"],
+              $fields["Custo Planejado"],
+              $fields["Custo Real"],
+              $fields["% Concluído"]
+            ]
+          | @tsv
+          '
+          
+          echo "Buscando dados das tarefas via API GraphQL..."
+          PROJECT_DATA_TSV=$(gh api graphql -f query="$GRAPHQL_QUERY" -F project_id="$PROJECT_NODE_ID" | jq -r "$JQ_FILTER")
+
+          if [ -z "$PROJECT_DATA_TSV" ]; then
+            echo "Aviso: Nenhum dado de tarefa foi retornado."
+            echo "VERIFIQUE SE OS NOMES DOS CAMPOS NO SEU PROJETO SÃO IDÊNTICOS AOS DO SCRIPT."
+          fi
+
+          TOTAL_BAC=0.0
+          TOTAL_PV=0.0
+          TOTAL_EV=0.0
+          TOTAL_AC=0.0
+          TOTAL_ITEMS=0
+          COMPLETED_ITEMS=0
+          TODAY_EPOCH=$(date +%s)
+          
+          echo "Processando itens do projeto..."
+
+          echo "$PROJECT_DATA_TSV" | while IFS=$'\t' read -r title status baseline_fim custo_planejado custo_real percent_concluido; do
+            
+            [ -z "$title" ] && continue
+            TOTAL_ITEMS=$((TOTAL_ITEMS + 1))
+
+            [ "$status" == "null" ] && status="Não Definido"
+            [ "$baseline_fim" == "null" ] && baseline_fim=""
+            [ "$custo_planejado" == "null" ] && custo_planejado="0.0"
+            [ "$custo_real" == "null" ] && custo_real="0.0"
+            [ "$percent_concluido" == "null" ] && percent_concluido="0.0"
+
+            if [[ "$status" == "Done" || "$status" == "Concluído" ]]; then
+              percent_concluido="100.0"
+              COMPLETED_ITEMS=$((COMPLETED_ITEMS + 1))
+            fi
+
+            TOTAL_BAC=$(echo "$TOTAL_BAC + $custo_planejado" | bc)
+            item_ev=$(echo "scale=2; ($custo_planejado * $percent_concluido) / 100" | bc)
+            TOTAL_EV=$(echo "$TOTAL_EV + $item_ev" | bc)
+            TOTAL_AC=$(echo "$TOTAL_AC + $custo_real" | bc)
+
+            if [[ -n "$baseline_fim" ]]; then
+              BASELINE_EPOCH=$(date -d "$baseline_fim" +%s)
+              if [ "$BASELINE_EPOCH" -le "$TODAY_EPOCH" ]; then
+                TOTAL_PV=$(echo "$TOTAL_PV + $custo_planejado" | bc)
+              fi
+            fi
+          done
+
+          echo "Cálculos de EVM concluídos."
+          echo "BAC (OAT) Total: $TOTAL_BAC"
+          echo "PV (VP) Total: $TOTAL_PV"
+          echo "EV (VA) Total: $TOTAL_EV"
+          echo "AC (CR) Total: $TOTAL_AC"
+
+          [ $(echo "$TOTAL_AC == 0" | bc) -eq 1 ] && TOTAL_AC=0.01
+          [ $(echo "$TOTAL_PV == 0" | bc) -eq 1 ] && TOTAL_PV=0.01
+          
+          CV=$(echo "scale=2; $TOTAL_EV - $TOTAL_AC" | bc)
+          SV=$(echo "scale=2; $TOTAL_EV - $TOTAL_PV" | bc)
+          CPI=$(echo "scale=2; $TOTAL_EV / $TOTAL_AC" | bc)
+          SPI=$(echo "scale=2; $TOTAL_EV / $TOTAL_PV" | bc)
+
+          if (( $(echo "$CPI < 1.0" | bc -l) )); then
+            CPI_STATUS="🔴 Custo Acima do Orçamento (CPI < 1)"
+          else
+            CPI_STATUS="🟢 Custo Dentro ou Abaixo do Orçamento (CPI >= 1)"
+          fi
+          if (( $(echo "$SPI < 1.0" | bc -l) )); then
+            SPI_STATUS="🔴 Atrasado no Cronograma (SPI < 1)"
+          else
+            SPI_STATUS="🟢 Adiantado ou no Prazo (SPI >= 1)"
+          fi
+
+          REPORT_BODY="## 📊 Status Report Semanal (Análise de Valor Agregado - EVM)<br/><br/>"
+          REPORT_BODY+="**Período de Referência:** $(date +'%d/%m/%Y')<br/><br/>"
+          REPORT_BODY+="### 1. Parecer sobre o Projeto (Visão EVM)<br/><br/>"
+          REPORT_BODY+="* **Situação de Custo:** $CPI_STATUS<br/>"
+          REPORT_BODY+="* **Situação de Prazo:** $SPI_STATUS<br/><br/>"
+          REPORT_BODY+="### 2. Métricas de Valor Agregado (PMBOK)<br/><br/>"
+          REPORT_BODY+="| Métrica (Unidade: Horas/Pontos) | Sigla | Valor |<br/>"
+          REPORT_BODY+="| :--- | :--- | :--- |<br/>"
+          REPORT_BODY+="| Orçamento no Término (Total) | **BAC** | **$TOTAL_BAC** |<br/>"
+          REPORT_BODY+="| Valor Planejado (Planejado) | **PV** | **$TOTAL_PV** |<br/>"
+          REPORT_BODY+="| Valor Agregado (Concluído) | **EV** | **$TOTAL_EV** |<br/>"
+          REPORT_BODY+="| Custo Real (Gasto) | **AC** | **$TOTAL_AC** |<br/><br/>"
+          REPORT_BODY+="### 3. Índices de Performance<br/><br/>"
+          REPORT_BODY+="| Índice | Sigla | Cálculo | Resultado | Interpretação (PMBOK) |<br/>"
+          REPORT_BODY+="| :--- | :--- | :--- | :--- | :--- |<br/>"
+          REPORT_BODY+="| Variação de Custo | **CV** | EV - AC | **$CV** | ( > 0 = Abaixo do custo )<br/>"
+          REPORT_BODY+="| Variação de Prazo | **SV** | EV - PV | **$SV** | ( > 0 = Adiantado )<br/>"
+          REPORT_BODY+="| Índice de Custo | **CPI** | EV / AC | **$CPI** | ( > 1 = Performance Boa )<br/>"
+          REPORT_BODY+="| Índice de Prazo | **SPI** | EV / PV | **$SPI** | ( > 1 = Performance Boa )<br/><br/>"
+          REPORT_BODY+="### 4. Status Geral das Tarefas<br/><br/>"
+          REPORT_BODY+="* **Total de Itens:** $TOTAL_ITEMS<br/>"
+          REPORT_BODY+="* **Itens Concluídos:** $COMPLETED_ITEMS<br/>"
+
+          echo "Publicando relatório na Issue #$REPORT_ISSUE_NUMBER..."
+          # O comando 'gh' agora funciona por causa do 'actions/checkout'
+          gh issue comment $REPORT_ISSUE_NUMBER --body-file - <<EOF
+          $REPORT_BODY
+          EOF
+          
+          echo "Relatório EVM publicado com sucesso."
